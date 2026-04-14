@@ -48,3 +48,7 @@
 - **Phase 3：UI 骨架搭建** 基于 PyQt5 开发无图表的框架窗体，实现托盘接管、窗口隐显控制与安全退出机制。
 - **Phase 4：数据可视化** 集成 `pyqtgraph` 组件，对接数据库实现历史数据拉取与动态折线图渲染，解决高频重绘的性能问题。
 - **Phase 5：配置与发布** 增加 JSON 配置系统（支持自定义保留天数），完善数据库生命周期管理（过期清理），配置 PyInstaller 输出单文件发行版。
+
+
+## 鸣谢 (Credits)
+* 软件图标 (Icon): [Hamstring from The Noun Project](https://thenounproject.com/)
