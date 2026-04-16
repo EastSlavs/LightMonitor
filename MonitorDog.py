@@ -5,6 +5,7 @@ import time
 import psutil
 import sqlite3
 import winreg
+import bisect
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
                              QSystemTrayIcon, QMenu, QAction, QActionGroup, qApp, QStyle, QTabWidget,
@@ -21,7 +22,6 @@ except ImportError:
 
 
 def get_resource_path(relative_path):
-    """获取资源绝对路径，兼容 Nuitka 与源码运行"""
     base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
     if not getattr(sys, 'frozen', False):
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +29,6 @@ def get_resource_path(relative_path):
 
 
 def get_data_dir():
-    """获取 Local AppData 存储目录"""
     appdata = os.getenv('LOCALAPPDATA')
     if not appdata:
         appdata = os.path.expanduser('~')
@@ -42,8 +41,6 @@ def get_data_dir():
 
 
 class TimeAxisItem(pg.DateAxisItem):
-    """自定义时间坐标轴"""
-
     def tickStrings(self, values, scale, spacing):
         strings = []
         for v in values:
@@ -58,8 +55,6 @@ class TimeAxisItem(pg.DateAxisItem):
 
 
 class AboutDialog(QDialog):
-    """关于窗口"""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("关于 LightMonitor")
@@ -112,7 +107,6 @@ class AboutDialog(QDialog):
 
 
 class MonitorWorker(QThread):
-    """数据采集线程"""
     data_updated = pyqtSignal(float, float, float, int, float, float)
     self_data_updated = pyqtSignal(float, float)
     error_updated = pyqtSignal(str)
@@ -221,8 +215,6 @@ class MonitorWorker(QThread):
 
 
 class LightMonitorApp(QMainWindow):
-    """主界面"""
-
     def __init__(self):
         super().__init__()
 
@@ -235,6 +227,8 @@ class LightMonitorApp(QMainWindow):
         self.time_data = []
         self.cpu_data, self.gpu_data = [], []
         self.mem_data, self.temp_data = [], []
+
+        self.hist_time, self.hist_cpu, self.hist_gpu, self.hist_temp = [], [], [], []
 
         self.initUI()
         self.initTray()
@@ -281,7 +275,6 @@ class LightMonitorApp(QMainWindow):
         pg.setConfigOption('foreground', '#d4d4d4')
 
         self.tabs = QTabWidget()
-        # 【修改核心】：增加 min-width: 80px; 强制撑开 Tab 宽度防止削边
         self.tabs.setStyleSheet("""
             QTabBar::tab { background: #2d2d30; color: #d4d4d4; padding: 8px 20px; font-weight: bold; min-width: 80px; }
             QTabBar::tab:selected { background: #007acc; color: white; }
@@ -397,6 +390,81 @@ class LightMonitorApp(QMainWindow):
 
         self.tabs.setCurrentIndex(self.config.get("last_tab", 0))
         self.tabs.currentChanged.connect(self.on_tab_changed)
+
+        self.init_crosshair()
+
+    def init_crosshair(self):
+        self.vlines = {}
+        self.labels = {}
+        self.graphs_map = {
+            "all": self.tab_all,
+            "cpu": self.tab_cpu,
+            "gpu": self.tab_gpu,
+            "mem": self.tab_mem,
+            "hist": self.graph_history
+        }
+
+        for name, graph in self.graphs_map.items():
+            vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(color='#888888', style=Qt.DashLine))
+            label = pg.TextItem(color='#d4d4d4', fill=pg.mkBrush(30, 30, 30, 200))
+            vline.hide()
+            label.hide()
+            graph.addItem(vline, ignoreBounds=True)
+            graph.addItem(label, ignoreBounds=True)
+            self.vlines[name] = vline
+            self.labels[name] = label
+            graph.scene().sigMouseMoved.connect(lambda pos, n=name: self.on_mouse_moved(pos, n))
+
+    def on_mouse_moved(self, pos, tab_name):
+        graph = self.graphs_map[tab_name]
+        if not graph.plotItem.vb.sceneBoundingRect().contains(pos):
+            self.vlines[tab_name].hide()
+            self.labels[tab_name].hide()
+            return
+
+        mouse_point = graph.plotItem.vb.mapSceneToView(pos)
+        x_val = mouse_point.x()
+
+        t_arr = self.hist_time if tab_name == "hist" else self.time_data
+        if not t_arr:
+            return
+
+        if x_val <= t_arr[0]:
+            idx = 0
+        elif x_val >= t_arr[-1]:
+            idx = len(t_arr) - 1
+        else:
+            idx = bisect.bisect_left(t_arr, x_val)
+            if idx > 0 and (x_val - t_arr[idx - 1] < t_arr[idx] - x_val):
+                idx -= 1
+
+        x_ts = t_arr[idx]
+        dt_str = QDateTime.fromSecsSinceEpoch(int(x_ts)).toString("MM-dd HH:mm:ss")
+
+        if tab_name == "all":
+            txt = f"{dt_str}\nCPU: {self.cpu_data[idx]:.1f}%\nMEM: {self.mem_data[idx]:.1f}%"
+            if self.has_nvidia:
+                txt += f"\nGPU: {self.gpu_data[idx]}%\nTMP: {self.temp_data[idx]:.1f}°C"
+        elif tab_name == "cpu":
+            txt = f"{dt_str}\nCPU: {self.cpu_data[idx]:.1f}%"
+        elif tab_name == "gpu":
+            txt = f"{dt_str}\nGPU: {self.gpu_data[idx]}%\nTMP: {self.temp_data[idx]:.1f}°C" if self.has_nvidia else f"{dt_str}\nNVIDIA Not Detected"
+        elif tab_name == "mem":
+            txt = f"{dt_str}\nMEM: {self.mem_data[idx]:.1f}%"
+        elif tab_name == "hist":
+            txt = f"{dt_str}\nCPU峰值: {self.hist_cpu[idx]:.1f}%"
+            if self.has_nvidia:
+                txt += f"\nGPU峰值: {self.hist_gpu[idx]}%\n温度峰值: {self.hist_temp[idx]:.1f}°C"
+
+        self.vlines[tab_name].setPos(x_ts)
+        self.vlines[tab_name].show()
+
+        view_rect = graph.viewRect()
+        anchor_x = 0 if x_val < view_rect.center().x() else 1
+        self.labels[tab_name].setAnchor((anchor_x, 1))
+        self.labels[tab_name].setText(txt)
+        self.labels[tab_name].setPos(x_ts, mouse_point.y())
+        self.labels[tab_name].show()
 
     def on_tab_changed(self, index):
         self.config["last_tab"] = index
@@ -651,15 +719,16 @@ class LightMonitorApp(QMainWindow):
             if not records:
                 self.graph_history.setTitle("无数据", color="#555555")
                 return
-            t_data = [r[0] for r in records]
-            c_data = [r[1] for r in records]
-            g_data = [r[2] for r in records]
-            tp_data = [r[3] for r in records]
 
-            self.line_hist_cpu.setData(t_data, c_data)
+            self.hist_time = [r[0] for r in records]
+            self.hist_cpu = [r[1] for r in records]
+            self.hist_gpu = [r[2] for r in records]
+            self.hist_temp = [r[3] for r in records]
+
+            self.line_hist_cpu.setData(self.hist_time, self.hist_cpu)
             if self.has_nvidia:
-                self.line_hist_gpu.setData(t_data, g_data)
-                self.line_hist_temp.setData(t_data, tp_data)
+                self.line_hist_gpu.setData(self.hist_time, self.hist_gpu)
+                self.line_hist_temp.setData(self.hist_time, self.hist_temp)
 
             self.graph_history.setTitle(f"数据加载完成 (精度: {bucket}s)", color="#4ec9b0", size="11pt")
         except:
