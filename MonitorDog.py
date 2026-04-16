@@ -110,6 +110,7 @@ class MonitorWorker(QThread):
     data_updated = pyqtSignal(float, float, float, int, float, float)
     self_data_updated = pyqtSignal(float, float)
     error_updated = pyqtSignal(str)
+    alert_triggered = pyqtSignal(str, str)
 
     def __init__(self, db_path, retention_days=7):
         super().__init__()
@@ -121,6 +122,13 @@ class MonitorWorker(QThread):
 
         self.my_process = psutil.Process(os.getpid())
         self.my_process.cpu_percent(interval=None)
+
+        self.is_high_load = False
+        self.high_load_seconds = 0
+        self.low_load_seconds = 0
+        self.high_load_start_time = 0
+        self.last_playtime_alert = 0
+        self.temp_cooldowns = {85: 0, 80: 0, 75: 0}
 
     def set_retention_days(self, days):
         self.retention_days = days
@@ -191,6 +199,33 @@ class MonitorWorker(QThread):
                     vram_usage = (mem_info.used / mem_info.total) * 100
                     gpu_temp = pynvml.nvmlDeviceGetTemperature(self.gpu_handle, pynvml.NVML_TEMPERATURE_GPU)
 
+                    if gpu_usage >= 80:
+                        self.high_load_seconds += 1
+                        self.low_load_seconds = 0
+                        if self.high_load_seconds >= 180 and not self.is_high_load:
+                            self.is_high_load = True
+                            self.high_load_start_time = current_time
+                            self.last_playtime_alert = current_time
+                    elif gpu_usage < 30:
+                        self.low_load_seconds += 1
+                        self.high_load_seconds = 0
+                        if self.low_load_seconds >= 300 and self.is_high_load:
+                            self.is_high_load = False
+
+                    if self.is_high_load:
+                        play_duration = current_time - self.high_load_start_time
+                        if play_duration >= 3600 and (current_time - self.last_playtime_alert >= 3600):
+                            hours = int(play_duration // 3600)
+                            self.alert_triggered.emit("运行提醒", f"设备已连续高负载运行 {hours} 小时。")
+                            self.last_playtime_alert = current_time
+
+                    for t_limit in [85, 80, 75]:
+                        if gpu_temp >= t_limit:
+                            if (current_time - self.temp_cooldowns[t_limit]) > 900:
+                                self.alert_triggered.emit("温度提醒", f"当前 GPU 温度已达 {gpu_temp}°C。")
+                                self.temp_cooldowns[t_limit] = current_time
+                            break
+
                 cursor.execute('''INSERT INTO monitor_data
                                       (timestamp, cpu_usage, mem_usage, gpu_usage, vram_usage, gpu_temp)
                                   VALUES (?, ?, ?, ?, ?, ?)''',
@@ -237,6 +272,7 @@ class LightMonitorApp(QMainWindow):
         self.worker.data_updated.connect(self.update_chart)
         self.worker.self_data_updated.connect(self.update_self_status)
         self.worker.error_updated.connect(self.show_error_status)
+        self.worker.alert_triggered.connect(self.show_tray_message)
         self.worker.start()
 
         self.load_history_data()
@@ -480,6 +516,10 @@ class LightMonitorApp(QMainWindow):
         if not self.isVisible(): return
         self.statusBar().setStyleSheet("color: #ff4d4d; font-weight: bold; background-color: #1e1e1e;")
         self.statusBar().showMessage(error_msg)
+
+    def show_tray_message(self, title, msg):
+        if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(title, msg, QSystemTrayIcon.Information, 5000)
 
     def get_autostart_status(self):
         try:
